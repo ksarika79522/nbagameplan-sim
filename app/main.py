@@ -4,6 +4,7 @@ from .db import get_db
 from .ingest import fetch_and_ingest_game_logs
 from .features import build_team_features_for_season, get_or_compute_team_features
 from .matchups import build_matchups_for_season
+from .ml import predict_win_probability
 from pydantic import BaseModel
 from typing import Optional
 from datetime import date
@@ -68,3 +69,34 @@ def get_team_features(
     if not features:
         raise HTTPException(status_code=404, detail="Features not found or insufficient history.")
     return features
+
+class PredictionRequest(BaseModel):
+    home_team_id: int
+    away_team_id: int
+    game_date: date
+    season: str
+    window: int = 10
+
+@app.post("/v1/predict/win-probability")
+def predict(req: PredictionRequest, db: Session = Depends(get_db)):
+    """
+    Predicts the win probability for the Home Team.
+    Fetches features for both teams as of the game_date and runs the ML model.
+    """
+    home_feat = get_or_compute_team_features(db, req.home_team_id, req.game_date, req.season, req.window)
+    away_feat = get_or_compute_team_features(db, req.away_team_id, req.game_date, req.season, req.window)
+    
+    if not home_feat or not away_feat:
+        raise HTTPException(status_code=404, detail="Insufficient data/history for one or both teams to make prediction.")
+    
+    try:
+        prob = predict_win_probability(home_feat, away_feat)
+        return {
+            "home_team_id": req.home_team_id,
+            "away_team_id": req.away_team_id,
+            "game_date": req.game_date,
+            "home_win_prob": prob,
+            "implied_odds_home": 1/prob if prob > 0 else 999.0
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

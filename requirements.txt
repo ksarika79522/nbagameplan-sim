@@ -6,3 +6,5 @@ python-dotenv
 nba_api
 pandas
 requests
+scikit-learn
+joblib
