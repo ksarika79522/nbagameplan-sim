@@ -105,3 +105,24 @@ class Matchup(Base):
     away_rate_3pa = Column(Float)
     away_rate_fta = Column(Float)
     away_rate_tov = Column(Float)
+
+class TeamDefFeature(Base):
+    __tablename__ = "team_def_features"
+
+    id = Column(Integer, primary_key=True, index=True)
+    team_id = Column(Integer, index=True, nullable=False)
+    as_of_date = Column(Date, index=True, nullable=False)
+    season = Column(String, nullable=False)
+    window = Column(Integer, nullable=False, default=10)
+    games_used = Column(Integer, nullable=False)
+
+    # Rolling Defensive Averages (Allowed)
+    def_avg_pts_allowed = Column(Float)
+    def_rate_3pa_allowed = Column(Float)
+    def_rate_fta_allowed = Column(Float)
+    def_rate_tov_forced = Column(Float)
+
+    # Unique constraint on (team_id, as_of_date, window)
+    __table_args__ = (
+        sqlalchemy.UniqueConstraint('team_id', 'as_of_date', 'window', name='uq_team_def_feature'),
+    )

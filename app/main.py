@@ -3,6 +3,8 @@ from sqlalchemy.orm import Session
 from .db import get_db
 from .ingest import fetch_and_ingest_game_logs
 from .features import build_team_features_for_season, get_or_compute_team_features
+from .defense_features import build_defense_features_for_season
+from .gameplan import generate_gameplan
 from .matchups import build_matchups_for_season
 from .ml import predict_win_probability
 from pydantic import BaseModel
@@ -42,6 +44,17 @@ def build_features(season: str, window: int = 10, min_games: int = 5, db: Sessio
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/v1/admin/build-defense-features/{season}")
+def build_defense_features(season: str, window: int = 10, min_games: int = 5, db: Session = Depends(get_db)):
+    """
+    Builds rolling defensive team features for the entire season.
+    """
+    try:
+        stats = build_defense_features_for_season(db, season, window, min_games)
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/v1/admin/build-matchups/{season}")
 def build_matchups(season: str, window: int = 10, db: Session = Depends(get_db)):
     """
@@ -76,6 +89,26 @@ class PredictionRequest(BaseModel):
     game_date: date
     season: str
     window: int = 10
+
+class GameplanRequest(BaseModel):
+    team_a_id: int
+    team_b_id: int
+    season: str
+    as_of_date: date
+    window: int = 10
+
+@app.post("/v1/gameplan")
+def get_gameplan(req: GameplanRequest, db: Session = Depends(get_db)):
+    """
+    Generates matchup-based gameplan tips for both teams.
+    """
+    try:
+        plan = generate_gameplan(db, req.team_a_id, req.team_b_id, req.season, req.as_of_date, req.window)
+        if not plan:
+            raise HTTPException(status_code=404, detail="Insufficient data to generate gameplan.")
+        return plan
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/v1/predict/win-probability")
 def predict(req: PredictionRequest, db: Session = Depends(get_db)):
