@@ -68,7 +68,7 @@ def generate_team_tips(team_off, team_def, opp_off, opp_def, baselines):
     candidate_tips = []
     
     def add_tip(condition_met, score, theme, text, evidence):
-        if condition_met and score > 0.6:
+        if condition_met and score > 0.3:
             candidate_tips.append({
                 "theme": theme,
                 "text": text,
@@ -88,7 +88,7 @@ def generate_team_tips(team_off, team_def, opp_off, opp_def, baselines):
     # Tip score is high if opponent allows more than average AND team shoots more than average
     score_3p = (opp_3p_allowed_z + team_3p_z) / 2
     add_tip(
-        opp_3p_allowed_z > 0.5,
+        opp_3p_allowed_z > 0.3,
         score_3p,
         "OFFENSE",
         "Emphasize three-point volume and drive-and-kick actions.",
@@ -100,7 +100,7 @@ def generate_team_tips(team_off, team_def, opp_off, opp_def, baselines):
     team_fta_z = get_z(team_off['rate_fta'], 'rate_fta')
     score_fta = (opp_fta_allowed_z + team_fta_z) / 2
     add_tip(
-        opp_fta_allowed_z > 0.5,
+        opp_fta_allowed_z > 0.3,
         score_fta,
         "OFFENSE",
         "Attack the paint and put pressure on the rim.",
@@ -110,7 +110,7 @@ def generate_team_tips(team_off, team_def, opp_off, opp_def, baselines):
     # 3. Overall Defensive Vulnerability
     opp_pts_allowed_z = get_z(opp_def['def_avg_pts_allowed'], 'def_avg_pts_allowed')
     add_tip(
-        opp_pts_allowed_z > 1.0,
+        opp_pts_allowed_z > 0.5,
         opp_pts_allowed_z,
         "PACE",
         "Push tempo and look for early offense.",
@@ -122,7 +122,7 @@ def generate_team_tips(team_off, team_def, opp_off, opp_def, baselines):
     opp_forced_tov_z = get_z(opp_def['def_rate_tov_forced'], 'def_rate_tov_forced')
     score_tov = (team_tov_z + opp_forced_tov_z) / 2
     add_tip(
-        team_tov_z > 0.5 and opp_forced_tov_z > 0.5,
+        team_tov_z > 0.3 and opp_forced_tov_z > 0.3,
         score_tov,
         "BALL CONTROL",
         "Protect the ball and avoid risky passes.",
@@ -133,15 +133,15 @@ def generate_team_tips(team_off, team_def, opp_off, opp_def, baselines):
     team_poss_z = get_z(team_off['avg_poss'], 'avg_poss')
     opp_poss_z = get_z(opp_off['avg_poss'], 'avg_poss')
     pace_diff_z = team_poss_z - opp_poss_z
-    if pace_diff_z > 1.0:
+    if pace_diff_z > 0.5:
         add_tip(True, pace_diff_z, "TEMPO", "Push pace and play faster than the opponent prefers.", f"Team pace is +{pace_diff_z:.1f} std dev vs opponent.")
-    elif pace_diff_z < -1.0:
+    elif pace_diff_z < -0.5:
         add_tip(True, abs(pace_diff_z), "TEMPO", "Control tempo and limit transition opportunities.", f"Team prefers slower pace (-{abs(pace_diff_z):.1f} std dev).")
 
     # 6. Defensive Priority (Shooters)
     opp_3pa_z = get_z(opp_off['rate_3pa'], 'rate_3pa')
     add_tip(
-        opp_3pa_z > 1.0,
+        opp_3pa_z > 0.5,
         opp_3pa_z,
         "DEFENSE",
         "Run shooters off the line and prioritize closeouts.",
@@ -151,12 +151,33 @@ def generate_team_tips(team_off, team_def, opp_off, opp_def, baselines):
     # 7. Defend without Fouling
     opp_fta_z = get_z(opp_off['rate_fta'], 'rate_fta')
     add_tip(
-        opp_fta_z > 1.0,
+        opp_fta_z > 0.5,
         opp_fta_z,
         "DEFENSE",
         "Defend without fouling and stay vertical.",
         f"Opponent excels at drawing contact (+{opp_fta_z:.1f} std dev)."
     )
+
+    # 8. Offensive Rebounding
+    team_oreb_z = get_z(team_off['avg_oreb'], 'avg_oreb')
+    add_tip(
+        team_oreb_z > 0.5,
+        team_oreb_z,
+        "EFFICIENCY",
+        "Crash the glass and look for second-chance opportunities.",
+        f"Team is strong on the offensive glass (+{team_oreb_z:.1f} std dev)."
+    )
+
+    # Ensure at least 3 tips by adding generic ones if necessary
+    generic_tips = [
+        {"theme": "FOCUS", "text": "Focus on high-quality shot selection and ball movement.", "score": 0.2, "evidence": "Baseline recommendation."},
+        {"theme": "DEFENSE", "text": "Communication on defensive rotations is key.", "score": 0.1, "evidence": "Baseline recommendation."},
+        {"theme": "ENERGY", "text": "Win the 50/50 balls and maintain high intensity.", "score": 0.05, "evidence": "Baseline recommendation."}
+    ]
+    
+    for gt in generic_tips:
+        if len(candidate_tips) < 3:
+            candidate_tips.append(gt)
 
     # Sort and return
     return sorted(candidate_tips, key=lambda x: x['score'], reverse=True)[:5]
