@@ -1,7 +1,7 @@
 from .db import engine, Base
 from .db import engine, Base
 from .db import engine, Base
-from .models import TeamGameLog, TeamFeature, Matchup
+from .models import TeamGameLog, TeamFeature, Matchup, TeamDefFeature
 
 def init_db():
     print("Creating database tables...")

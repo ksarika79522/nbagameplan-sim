@@ -2,134 +2,168 @@ import logging
 from datetime import date
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func
-from .models import TeamFeature, TeamDefFeature
+from .models import TeamFeature, TeamDefFeature, SeasonFeatureBaseline, Matchup
 from .features import get_or_compute_team_features
 from .defense_features import get_or_compute_def_features
-from .ml import predict_win_probability
+from .ml import predict_win_probability, MODEL_PATH
+from .baselines import get_baselines_dict
 import pandas as pd
 import numpy as np
+import joblib
+import os
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def get_league_averages(db: Session, season: str, window: int):
+def get_feature_contributions(home_features, away_features):
     """
-    Computes league-wide averages and std devs for offensive and defensive features.
+    Computes top feature contributions for Team A (Home) win probability.
+    Returns list of {feature, contribution}.
     """
-    # Offensive Averages
-    off_query = select(
-        func.avg(TeamFeature.avg_pts).label('avg_pts'),
-        func.avg(TeamFeature.avg_poss).label('avg_poss'),
-        func.avg(TeamFeature.rate_3pa).label('rate_3pa'),
-        func.avg(TeamFeature.rate_fta).label('rate_fta'),
-        func.avg(TeamFeature.rate_tov).label('rate_tov'),
-        func.stddev(TeamFeature.avg_pts).label('std_pts'),
-        func.stddev(TeamFeature.rate_3pa).label('std_3pa'),
-        func.stddev(TeamFeature.rate_fta).label('std_fta'),
-        func.stddev(TeamFeature.rate_tov).label('std_tov')
-    ).filter(TeamFeature.season == season, TeamFeature.window == window)
-    
-    off_res = db.execute(off_query).first()
-    
-    # Defensive Averages
-    def_query = select(
-        func.avg(TeamDefFeature.def_avg_pts_allowed).label('avg_pts_allowed'),
-        func.avg(TeamDefFeature.def_rate_3pa_allowed).label('rate_3pa_allowed'),
-        func.avg(TeamDefFeature.def_rate_fta_allowed).label('rate_fta_allowed'),
-        func.avg(TeamDefFeature.def_rate_tov_forced).label('rate_tov_forced'),
-        func.stddev(TeamDefFeature.def_avg_pts_allowed).label('std_pts_allowed'),
-        func.stddev(TeamDefFeature.def_rate_3pa_allowed).label('std_3pa_allowed'),
-        func.stddev(TeamDefFeature.def_rate_fta_allowed).label('std_fta_allowed'),
-        func.stddev(TeamDefFeature.def_rate_tov_forced).label('std_tov_forced')
-    ).filter(TeamDefFeature.season == season, TeamDefFeature.window == window)
-    
-    def_res = db.execute(def_query).first()
-    
-    return {
-        'off': off_res,
-        'def': def_res
-    }
+    if not os.path.exists(MODEL_PATH):
+        return []
 
-def generate_team_tips(team_off, team_def, opp_off, opp_def, league_avgs):
+    pipeline = joblib.load(MODEL_PATH)
+    model = pipeline.named_steps['model']
+    scaler = pipeline.named_steps['scaler']
+    
+    # Reconstruct input vector (Home then Away)
+    feature_cols = [
+        col.name for col in Matchup.__table__.columns 
+        if col.name not in ['id', 'game_id', 'game_date', 'season', 'home_team_id', 'away_team_id', 'home_win']
+    ]
+    
+    input_data = {}
+    for k, v in home_features.items():
+        if f"home_{k}" in feature_cols: input_data[f"home_{k}"] = v
+    for k, v in away_features.items():
+        if f"away_{k}" in feature_cols: input_data[f"away_{k}"] = v
+        
+    df = pd.DataFrame([input_data])
+    for col in feature_cols:
+        if col not in df.columns: df[col] = 0.0
+    df = df[feature_cols]
+    
+    # Standardize
+    X_scaled = scaler.transform(df)[0]
+    
+    # Contribution = scaled_value * coefficient
+    # For LogReg, positive contribution means increases prob of Class 1 (Home Win)
+    coeffs = model.coef_[0]
+    contributions = []
+    for i, col in enumerate(feature_cols):
+        contributions.append({
+            "feature": col,
+            "contribution": float(X_scaled[i] * coeffs[i])
+        })
+        
+    # Sort by absolute contribution
+    contributions = sorted(contributions, key=lambda x: abs(x['contribution']), reverse=True)
+    return contributions[:3]
+
+def generate_team_tips(team_off, team_def, opp_off, opp_def, baselines):
     """
-    Generates and ranks tips for a single team.
+    Generates and ranks tips for a single team using z-scores and rarity.
     """
-    tips = []
-    l_off = league_avgs['off']
-    l_def = league_avgs['def']
+    candidate_tips = []
+    
+    def add_tip(condition_met, score, theme, text, evidence):
+        if condition_met and score > 0.6:
+            candidate_tips.append({
+                "theme": theme,
+                "text": text,
+                "score": round(float(score), 2),
+                "evidence": evidence
+            })
 
-    # OFFENSE vs OPPONENT DEFENSE
-    # 1. Opponent allows many 3s
-    if opp_def['def_rate_3pa_allowed'] > (l_def.rate_3pa_allowed or 0):
-        score = (opp_def['def_rate_3pa_allowed'] - (l_def.rate_3pa_allowed or 0)) / (l_def.std_3pa_allowed or 1)
-        tips.append({
-            "text": "Emphasize three-point volume and drive-and-kick actions.",
-            "score": float(score)
-        })
+    # Helper for z-score
+    def get_z(val, feat):
+        b = baselines.get(feat)
+        if not b or b['std'] == 0: return 0
+        return (val - b['mean']) / b['std']
 
-    # 2. Opponent allows many FTs
-    if opp_def['def_rate_fta_allowed'] > (l_def.rate_fta_allowed or 0):
-        score = (opp_def['def_rate_fta_allowed'] - (l_def.rate_fta_allowed or 0)) / (l_def.std_fta_allowed or 1)
-        tips.append({
-            "text": "Attack the paint and put pressure on the rim.",
-            "score": float(score)
-        })
+    # 1. Opponent 3P Weakness vs Team 3P Tendency
+    opp_3p_allowed_z = get_z(opp_def['def_rate_3pa_allowed'], 'def_rate_3pa_allowed')
+    team_3p_z = get_z(team_off['rate_3pa'], 'rate_3pa')
+    # Tip score is high if opponent allows more than average AND team shoots more than average
+    score_3p = (opp_3p_allowed_z + team_3p_z) / 2
+    add_tip(
+        opp_3p_allowed_z > 0.5,
+        score_3p,
+        "OFFENSE",
+        "Emphasize three-point volume and drive-and-kick actions.",
+        f"Opponent allows 3PA at a {opp_3p_allowed_z:.1f} std dev rate."
+    )
 
-    # 3. Opponent allows many points (Overall Weakness)
-    if opp_def['def_avg_pts_allowed'] > (l_def.avg_pts_allowed or 0):
-        score = (opp_def['def_avg_pts_allowed'] - (l_def.avg_pts_allowed or 0)) / (l_def.std_pts_allowed or 1)
-        tips.append({
-            "text": "Push tempo and look for early offense.",
-            "score": float(score)
-        })
+    # 2. Attack the Rim (FTA)
+    opp_fta_allowed_z = get_z(opp_def['def_rate_fta_allowed'], 'def_rate_fta_allowed')
+    team_fta_z = get_z(team_off['rate_fta'], 'rate_fta')
+    score_fta = (opp_fta_allowed_z + team_fta_z) / 2
+    add_tip(
+        opp_fta_allowed_z > 0.5,
+        score_fta,
+        "OFFENSE",
+        "Attack the paint and put pressure on the rim.",
+        f"Opponent gives up free throws at a {opp_fta_allowed_z:.1f} std dev rate."
+    )
 
-    # 4. Team turns it over AND Opponent forces many turnovers
-    if team_off['rate_tov'] > (l_off.rate_tov or 0) and opp_def['def_rate_tov_forced'] > (l_def.rate_tov_forced or 0):
-        score = ((team_off['rate_tov'] - (l_off.rate_tov or 0)) / (l_off.std_tov or 1) + 
-                 (opp_def['def_rate_tov_forced'] - (l_def.rate_tov_forced or 0)) / (l_def.std_tov_forced or 1))
-        tips.append({
-            "text": "Protect the ball and avoid risky passes.",
-            "score": float(score)
-        })
+    # 3. Overall Defensive Vulnerability
+    opp_pts_allowed_z = get_z(opp_def['def_avg_pts_allowed'], 'def_avg_pts_allowed')
+    add_tip(
+        opp_pts_allowed_z > 1.0,
+        opp_pts_allowed_z,
+        "PACE",
+        "Push tempo and look for early offense.",
+        f"Opponent ranks in bottom tier for points allowed ({opp_def['def_avg_pts_allowed']:.1f} PPG)."
+    )
 
-    # TEMPO / STYLE
-    # 5. Pace mismatch
-    pace_diff = team_off['avg_poss'] - opp_off['avg_poss']
-    if pace_diff > 3: # 3 more possessions than opponent
-        tips.append({
-            "text": "Push pace and play faster than the opponent prefers.",
-            "score": float(pace_diff / 5.0) # Normalized roughly
-        })
-    elif pace_diff < -3:
-        tips.append({
-            "text": "Control tempo and limit transition opportunities.",
-            "score": float(abs(pace_diff) / 5.0)
-        })
+    # 4. Ball Security
+    team_tov_z = get_z(team_off['rate_tov'], 'rate_tov')
+    opp_forced_tov_z = get_z(opp_def['def_rate_tov_forced'], 'def_rate_tov_forced')
+    score_tov = (team_tov_z + opp_forced_tov_z) / 2
+    add_tip(
+        team_tov_z > 0.5 and opp_forced_tov_z > 0.5,
+        score_tov,
+        "BALL CONTROL",
+        "Protect the ball and avoid risky passes.",
+        f"High turnover risk: Opponent forces TOs at +{opp_forced_tov_z:.1f} std dev."
+    )
 
-    # DEFENSIVE FOCUS
-    # 6. Opponent shoots many 3s
-    if opp_off['rate_3pa'] > (l_off.rate_3pa or 0):
-        score = (opp_off['rate_3pa'] - (l_off.rate_3pa or 0)) / (l_off.std_3pa or 1)
-        tips.append({
-            "text": "Run shooters off the line and prioritize closeouts.",
-            "score": float(score)
-        })
+    # 5. Pace Control
+    team_poss_z = get_z(team_off['avg_poss'], 'avg_poss')
+    opp_poss_z = get_z(opp_off['avg_poss'], 'avg_poss')
+    pace_diff_z = team_poss_z - opp_poss_z
+    if pace_diff_z > 1.0:
+        add_tip(True, pace_diff_z, "TEMPO", "Push pace and play faster than the opponent prefers.", f"Team pace is +{pace_diff_z:.1f} std dev vs opponent.")
+    elif pace_diff_z < -1.0:
+        add_tip(True, abs(pace_diff_z), "TEMPO", "Control tempo and limit transition opportunities.", f"Team prefers slower pace (-{abs(pace_diff_z):.1f} std dev).")
 
-    # 7. Opponent attacks rim (FTA)
-    if opp_off['rate_fta'] > (l_off.rate_fta or 0):
-        score = (opp_off['rate_fta'] - (l_off.rate_fta or 0)) / (l_off.std_fta or 1)
-        tips.append({
-            "text": "Defend without fouling and stay vertical.",
-            "score": float(score)
-        })
+    # 6. Defensive Priority (Shooters)
+    opp_3pa_z = get_z(opp_off['rate_3pa'], 'rate_3pa')
+    add_tip(
+        opp_3pa_z > 1.0,
+        opp_3pa_z,
+        "DEFENSE",
+        "Run shooters off the line and prioritize closeouts.",
+        f"Opponent ranks high in 3P volume (+{opp_3pa_z:.1f} std dev)."
+    )
 
-    # Sort and return top 3-5
-    tips = sorted(tips, key=lambda x: x['score'], reverse=True)
-    return [t['text'] for t in tips[:5]]
+    # 7. Defend without Fouling
+    opp_fta_z = get_z(opp_off['rate_fta'], 'rate_fta')
+    add_tip(
+        opp_fta_z > 1.0,
+        opp_fta_z,
+        "DEFENSE",
+        "Defend without fouling and stay vertical.",
+        f"Opponent excels at drawing contact (+{opp_fta_z:.1f} std dev)."
+    )
+
+    # Sort and return
+    return sorted(candidate_tips, key=lambda x: x['score'], reverse=True)[:5]
 
 def generate_gameplan(db: Session, team_a_id: int, team_b_id: int, season: str, as_of_date: date, window: int):
     """
-    Generates a full gameplan for both teams.
+    Generates a full gameplan for both teams with explainability.
     """
     # 1. Load Features
     a_off = get_or_compute_team_features(db, team_a_id, as_of_date, season, window)
@@ -141,17 +175,21 @@ def generate_gameplan(db: Session, team_a_id: int, team_b_id: int, season: str, 
         return None
 
     # 2. Get Win Probability
-    # Note: predict_win_probability expects (home_features, away_features)
-    # Here we treat team_a as home and team_b as away for the sake of the model.
     win_prob_a = predict_win_probability(a_off, b_off)
     win_prob_b = 1.0 - win_prob_a
 
-    # 3. Get League Averages
-    league_avgs = get_league_averages(db, season, window)
+    # 3. Get Explainability
+    factors = get_feature_contributions(a_off, b_off)
 
-    # 4. Generate Tips
-    tips_a = generate_team_tips(a_off, a_def, b_off, b_def, league_avgs)
-    tips_b = generate_team_tips(b_off, b_def, a_off, a_def, league_avgs)
+    # 4. Get Baselines
+    baselines = get_baselines_dict(db, season, window)
+    if not baselines:
+        logger.warning("No baselines found. Run compute-baselines first.")
+        return None
+
+    # 5. Generate Tips
+    tips_a = generate_team_tips(a_off, a_def, b_off, b_def, baselines)
+    tips_b = generate_team_tips(b_off, b_def, a_off, a_def, baselines)
 
     return {
         "team_a": {
@@ -161,6 +199,7 @@ def generate_gameplan(db: Session, team_a_id: int, team_b_id: int, season: str, 
         "team_b": {
             "win_prob": round(win_prob_b, 3),
             "tips": tips_b
-        }
+        },
+        "top_factors": factors
     }
 

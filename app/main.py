@@ -1,15 +1,20 @@
 from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from .db import get_db
+from .db import get_db, engine, Base
 from .ingest import fetch_and_ingest_game_logs
 from .features import build_team_features_for_season, get_or_compute_team_features
 from .defense_features import build_defense_features_for_season
 from .gameplan import generate_gameplan
 from .matchups import build_matchups_for_season
 from .ml import predict_win_probability
+from .baselines import compute_and_store_baselines
+from .eval import run_model_evaluation
 from pydantic import BaseModel
 from typing import Optional
 from datetime import date
+
+# Create tables if they don't exist
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="NBA Team Gameplan Simulator")
 
@@ -64,6 +69,28 @@ def build_matchups(season: str, window: int = 10, db: Session = Depends(get_db))
     try:
         stats = build_matchups_for_season(db, season, window)
         return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/v1/admin/compute-baselines/{season}")
+def compute_baselines(season: str, window: int = 10, db: Session = Depends(get_db)):
+    """
+    Computes and stores league-wide feature baselines (mean, std, percentiles).
+    """
+    try:
+        stats = compute_and_store_baselines(db, season, window)
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/v1/admin/model-report/{season}")
+def get_model_report(season: str, window: int = 10, db: Session = Depends(get_db)):
+    """
+    Runs walk-forward validation and returns model metrics (AUC, Accuracy, Brier).
+    """
+    try:
+        report = run_model_evaluation(db, season, window)
+        return report
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

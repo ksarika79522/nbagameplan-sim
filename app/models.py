@@ -126,3 +126,24 @@ class TeamDefFeature(Base):
     __table_args__ = (
         sqlalchemy.UniqueConstraint('team_id', 'as_of_date', 'window', name='uq_team_def_feature'),
     )
+
+class SeasonFeatureBaseline(Base):
+    __tablename__ = "season_feature_baselines"
+
+    id = Column(Integer, primary_key=True, index=True)
+    season = Column(String, index=True, nullable=False)
+    window = Column(Integer, index=True, nullable=False)
+    feature_name = Column(String, nullable=False)
+    
+    mean = Column(Float)
+    std = Column(Float)
+    p10 = Column(Float)
+    p25 = Column(Float)
+    p50 = Column(Float)
+    p75 = Column(Float)
+    p90 = Column(Float)
+
+    # Unique constraint on (season, window, feature_name)
+    __table_args__ = (
+        sqlalchemy.UniqueConstraint('season', 'window', 'feature_name', name='uq_season_feature_baseline'),
+    )
